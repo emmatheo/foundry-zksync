@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract GuessingGame {
+    uint8 private secretNumber;
+    address public owner;
+    bool public gameActive;
+
+    // Event to log guess attempts
+    event GuessAttempt(address indexed player, bool success);
+
+    // Modifier to check if the caller is the owner
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+
+    // Modifier to check if the game is active
+    modifier isGameActive() {
+        require(gameActive, "Game is not active");
+        _;
+    }
+
+    // Constructor to initialize the contract
+    constructor() {
+        owner = msg.sender;
+        gameActive = true;
+    }
+
+    // Function for the owner to set the secret number
+    function setSecretNumber(uint8 _secretNumber) public onlyOwner {
+        secretNumber = _secretNumber;
+    }
+
+    // Function to guess the number
+    function guess(uint8 _guess) public isGameActive {
+        if (_guess == secretNumber) {
+            gameActive = false; // End the game if the guess is correct
+            emit GuessAttempt(msg.sender, true);
+        } else {
+            emit GuessAttempt(msg.sender, false);
+        }
+    }
+
+    // Function to end the game manually
+    function endGame() public onlyOwner {
+        gameActive = false;
+    }
+
+    // Function to start a new game
