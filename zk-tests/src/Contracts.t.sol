@@ -45,11 +45,16 @@ contract MultiNumber {
 contract PayableFixedNumber {
     address sender;
     uint256 value;
+    receive() external payable {}
 
     constructor() payable {
         sender = msg.sender;
         value = msg.value;
         console.log(msg.value);
+    }
+
+    function transfer(address payable dest, uint256 amt) public {
+        dest.call{value: amt}("");
     }
 
     function five() public pure returns (uint8) {
@@ -168,6 +173,22 @@ contract ZkContractsTest is Test {
         require(address(payableFixedNumber).balance == 10, "incorrect balance");
     }
 
+    function testZkContractsExpectedBalances() public {
+        vm.selectFork(forkEra);
+        uint balanceBefore = address(this).balance;
+
+        PayableFixedNumber one = new PayableFixedNumber{
+            value: 10
+        }();
+
+        PayableFixedNumber two = new PayableFixedNumber();
+        one.transfer(payable(address(two)), 5);
+
+        require(address(one).balance == 5, "first contract's balance not decreased");
+        require(address(two).balance == 5, "second contract's balance not increased");
+        require(address(this).balance == balanceBefore - 10, "test address balance not decreased");
+    }
+
     function testZkContractsInlineDeployedContractComplexArgs() public {
         CustomStorage customStorage = new CustomStorage("hello", 10);
         vm.makePersistent(address(customStorage));
@@ -209,12 +230,9 @@ contract ZkContractsTest is Test {
 
         // ConstantNumber zksolc hash obtained from zkout/ConstantNumber.sol/artifacts.json
         string memory artifact = vm.readFile(
-            "zkout/ConstantNumber.sol/artifacts.json"
+            "zkout/ConstantNumber.sol/ConstantNumber.json"
         );
-        bytes32 bytecodeHash = vm.parseJsonBytes32(
-            artifact,
-            '.contracts.["src/ConstantNumber.sol"].ConstantNumber.hash'
-        );
+        bytes32 bytecodeHash = vm.parseJsonBytes32(artifact, ".hash");
         address sender = address(0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496);
         bytes32 salt = "12345";
         bytes32 constructorInputHash = keccak256(abi.encode());

@@ -56,6 +56,7 @@ While `foundry-zksync` is **alpha stage**, there are some limitations to be awar
 - **Create2 Address Derivation**: There are differences in Create2 Address derivation compared to Ethereum. [Read the details](https://era.zksync.io/docs/reference/architecture/differences-with-ethereum.html#create-create2).
 - **Contract Verification**: Currently contract verification via the `--verify` flag do not work as expected but will be added shortly.  
 - **Specific Foundry Features**: Currently features such as `--gas-report`, `--coverage` may not work as intended. We are actively working on providing support for these feature types.
+- **Solc Compatibility**: `zksolc` requires a `solc` binary to be run as a child process. The version/path to use for each can be specified by the `zksolc` and `solc` options in `foundry.toml`. Not all `solc` versions are supported by all `zksolc` versions, compiling with a `solc` version higher than the one supported may lead to unexpected errors. [Read the docs](https://docs.zksync.io/zk-stack/components/compiler/toolchain/solidity.html#limitations) about version limitations and check the [zksolc changelog](https://github.com/matter-labs/era-compiler-solidity/blob/main/CHANGELOG.md) to see the latest supported `solc` version.
 
 For the most effective use of our library, we recommend familiarizing yourself with these features and limitations.
 
@@ -79,21 +80,14 @@ Follow these steps to quickly install the binaries for `foundry-zksync`:
    cd foundry-zksync
    ```
 
-3. **Make the Installer Executable**:
-   Before running the installation script, ensure it is executable. This step is crucial for allowing the script to run without permission issues.
-
-   ```bash
-   chmod +x ./install-foundry-zksync
-   ```
-
-4. **Run the Installer**:
+3. **Run the Installer**:
    Now, you're ready to execute the installation script. This command initializes the setup and installs `foundry-zksync` binaries `forge` and `cast`.
 
    ```bash
    ./install-foundry-zksync
    ```
 
-5. **Verify the Installation** (Recommended):
+4. **Verify the Installation** (Recommended):
    After installation, it's good practice to verify that the binaries have been installed correctly. Run the following command to check the installed version:
 
    ```bash

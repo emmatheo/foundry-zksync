@@ -590,13 +590,22 @@ impl<DB: DatabaseExt + Send> Inspector<DB> for Cheatcodes {
     }
 
     fn step_end(&mut self, interpreter: &mut Interpreter<'_>, data: &mut EVMData<'_, DB>) {
-        if self.use_zk_vm && interpreter.current_opcode() == opcode::BALANCE {
-            if interpreter.stack.is_empty() {
-                interpreter.instruction_result = InstructionResult::StackUnderflow;
-                return;
-            }
+        // ovverride address(x).balance retrieval to make it consistent between EraVM and EVM
+        if self.use_zk_vm {
+            let address = match interpreter.current_opcode() {
+                opcode::SELFBALANCE => interpreter.contract().address,
+                opcode::BALANCE => {
+                    if interpreter.stack.is_empty() {
+                        interpreter.instruction_result = InstructionResult::StackUnderflow;
+                        return;
+                    }
+
+                    Address::from_word(B256::from(unsafe { interpreter.stack.pop_unsafe() }))
+                }
+                _ => return,
+            };
+
             // Safety: Length is checked above.
-            let address = Address::from_word(B256::from(unsafe { interpreter.stack.pop_unsafe() }));
             let balance = foundry_zksync_core::balance(address, data.db, &mut data.journaled_state);
 
             // Skip the current BALANCE instruction since we've already handled it
@@ -1233,13 +1242,12 @@ impl<DB: DatabaseExt + Send> Inspector<DB> for Cheatcodes {
             }
 
             info!("running call in zk vm {:#?}", call);
-            let persisted_factory_deps = self.persisted_factory_deps.clone();
 
             let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
                 mocked_calls: self.mocked_calls.clone(),
                 expected_calls: Some(&mut self.expected_calls),
                 accesses: self.accesses.as_mut(),
-                persisted_factory_deps,
+                persisted_factory_deps: Some(&mut self.persisted_factory_deps),
             };
             if let Ok(result) = foundry_zksync_core::vm::call::<_, DatabaseError>(
                 call,
@@ -1248,28 +1256,22 @@ impl<DB: DatabaseExt + Send> Inspector<DB> for Cheatcodes {
                 &mut data.journaled_state,
                 ccx,
             ) {
-                return match result {
-                    ExecutionResult::Success { output, logs, .. } => match output {
-                        Output::Call(bytes) => {
-                            self.combined_logs.extend(logs.clone().into_iter().map(|log| {
-                                Some(Log {
-                                    address: log.address,
-                                    data: LogData::new_unchecked(log.topics, log.data),
-                                })
-                            }));
-                            //for each log in cloned logs call handle_expect_emit
-                            if !self.expected_emits.is_empty() {
-                                for log in logs {
-                                    expect::handle_expect_emit(
-                                        self,
-                                        &log.address,
-                                        &log.topics,
-                                        &log.data,
-                                    );
-                                }
-                            }
-                            (InstructionResult::Return, gas, bytes)
-                        }
+                self.combined_logs.extend(result.logs.clone().into_iter().map(|log| {
+                    Some(Log {
+                        address: log.address,
+                        data: LogData::new_unchecked(log.topics, log.data),
+                    })
+                }));
+                //for each log in cloned logs call handle_expect_emit
+                if !self.expected_emits.is_empty() {
+                    for log in result.logs {
+                        expect::handle_expect_emit(self, &log.address, &log.topics, &log.data);
+                    }
+                }
+
+                return match result.execution_result {
+                    ExecutionResult::Success { output, .. } => match output {
+                        Output::Call(bytes) => (InstructionResult::Return, gas, bytes),
                         _ => (InstructionResult::Revert, gas, Bytes::new()),
                     },
                     ExecutionResult::Revert { output, .. } => {
@@ -1709,22 +1711,12 @@ impl<DB: DatabaseExt + Send> Inspector<DB> for Cheatcodes {
                 .unwrap_or_else(|| panic!("failed finding contract for {:?}", call.init_code));
 
             let factory_deps = self.dual_compiled_contracts.fetch_all_factory_deps(zk_contract);
-
-            // get the current persisted factory deps to pass to zk create
-            let persisted_factory_deps = self.persisted_factory_deps.clone();
-            // and extend it for future calls
-            self.persisted_factory_deps.extend(
-                factory_deps
-                    .iter()
-                    .map(|dep| (foundry_zksync_core::hash_bytecode(dep), dep.clone())),
-            );
-
             tracing::debug!(contract = zk_contract.name, "using dual compiled contract");
             let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
                 mocked_calls: self.mocked_calls.clone(),
                 expected_calls: Some(&mut self.expected_calls),
                 accesses: self.accesses.as_mut(),
-                persisted_factory_deps,
+                persisted_factory_deps: Some(&mut self.persisted_factory_deps),
             };
             if let Ok(result) = foundry_zksync_core::vm::create::<_, DatabaseError>(
                 call,
@@ -1735,15 +1727,23 @@ impl<DB: DatabaseExt + Send> Inspector<DB> for Cheatcodes {
                 &mut data.journaled_state,
                 ccx,
             ) {
-                return match result {
-                    ExecutionResult::Success { output, logs, .. } => match output {
+                self.combined_logs.extend(result.logs.clone().into_iter().map(|log| {
+                    Some(Log {
+                        address: log.address,
+                        data: LogData::new_unchecked(log.topics, log.data),
+                    })
+                }));
+
+                // for each log in cloned logs call handle_expect_emit
+                if !self.expected_emits.is_empty() {
+                    for log in result.logs {
+                        expect::handle_expect_emit(self, &log.address, &log.topics, &log.data);
+                    }
+                }
+
+                return match result.execution_result {
+                    ExecutionResult::Success { output, .. } => match output {
                         Output::Create(bytes, address) => {
-                            self.combined_logs.extend(logs.into_iter().map(|log| {
-                                Some(Log {
-                                    address: log.address,
-                                    data: LogData::new_unchecked(log.topics, log.data),
-                                })
-                            }));
                             (InstructionResult::Return, address, gas, bytes)
                         }
                         _ => (InstructionResult::Revert, None, gas, Bytes::new()),

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use foundry_compilers::{artifacts::output_selection::ContractOutputSelection, EvmVersion};
 use serde::Serialize;
@@ -56,6 +58,15 @@ pub struct CompilerArgs {
     #[clap(help_heading = "Use ZKSync era vm", long)]
     pub zksync: bool,
 
+    #[clap(
+        help_heading = "zkSync Compiler options",
+        help = "Solc compiler path to use when compiling with zksolc",
+        long = "zk-solc-path",
+        value_name = "ZK_SOLC_PATH"
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zk_solc_path: Option<PathBuf>,
+
     /// A flag indicating whether to enable the system contract compilation mode.
     #[clap(
         help_heading = "zkSync Compiler options",
@@ -105,12 +116,12 @@ pub struct CompilerArgs {
     #[serde(skip)]
     pub zk_optimizer: bool,
 
-    /// Contracts to compile
-    #[clap(long, help_heading = "Contracts to compile", value_delimiter = ',')]
-    pub contracts_to_compile: Option<Vec<String>>,
-
-    /// Contracts to avoid compiling
-    #[clap(long, help_heading = "Contracts to avoid compilation", value_delimiter = ',')]
+    /// Contracts to avoid compiling on zkSync
+    #[clap(
+        long,
+        help_heading = "Contracts to avoid during zkSync compilation",
+        value_delimiter = ','
+    )]
     pub avoid_contracts: Option<Vec<String>>,
 }
 

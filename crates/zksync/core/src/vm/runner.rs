@@ -32,8 +32,9 @@ use revm::{
     precompile::Precompiles,
     primitives::{
         Address, Bytecode, Bytes, CreateScheme, EVMResultGeneric, Env, Eval,
-        ExecutionResult as rExecutionResult, Halt as rHalt, HashMap as rHashMap, OutOfGasError,
-        Output, ResultAndState, SpecId, StorageSlot, TransactTo, B256, U256 as rU256,
+        ExecutionResult as rExecutionResult, Halt as rHalt, HashMap as rHashMap, Log as rLog,
+        OutOfGasError, Output, ResultAndState, SpecId, StorageSlot, TransactTo, B256,
+        U256 as rU256,
     },
     Database, JournaledState,
 };
@@ -41,7 +42,7 @@ use tracing::{info, trace};
 use zksync_basic_types::{L2ChainId, H256};
 use zksync_state::{ReadStorage, StoragePtr, WriteStorage};
 use zksync_types::{
-    ethabi, fee::Fee, l2::L2Tx, transaction_request::PaymasterParams, vm_trace::Call,
+    ethabi, fee::Fee, l2::L2Tx, transaction_request::PaymasterParams, vm_trace::Call, Nonce,
     PackedEthSignature, StorageKey, Transaction, VmEvent, ACCOUNT_CODE_STORAGE_ADDRESS,
     CONTRACT_DEPLOYER_ADDRESS, H160, U256,
 };
@@ -57,7 +58,18 @@ use super::{storage_view::StorageView, tracer::CheatcodeTracerContext};
 /// Maximum gas price allowed for L1.
 const MAX_L1_GAS_PRICE: u64 = 1000;
 
-type ZKVMResult<E> = EVMResultGeneric<rExecutionResult, E>;
+/// Maximum size allowed for factory_deps during create.
+/// We batch factory_deps till this upper limit if there are multiple deps.
+/// These batches are they deployed individually
+const MAX_FACTORY_DEPENDENCIES_SIZE_BYTES: usize = 100000; // 100kB
+
+#[derive(Debug)]
+pub struct ZKVMExecutionResult {
+    pub logs: Vec<rLog>,
+    pub execution_result: rExecutionResult,
+}
+
+type ZKVMResult<E> = EVMResultGeneric<ZKVMExecutionResult, E>;
 
 /// Transacts
 pub fn transact<'a, DB>(
@@ -88,6 +100,7 @@ where
     };
 
     let (gas_limit, max_fee_per_gas) = gas_params(env, db, &mut journaled_state, caller);
+    info!(?gas_limit, ?max_fee_per_gas, "tx gas parameters");
     let tx = L2Tx::new(
         transact_to,
         env.tx.data.to_vec(),
@@ -115,8 +128,17 @@ where
         is_create,
     };
 
-    match inspect::<_, DB::Error>(tx, env, db, &mut journaled_state, Default::default(), call_ctx) {
-        Ok(result) => Ok(ResultAndState { result, state: journaled_state.finalize().0 }),
+    match inspect::<_, DB::Error>(
+        tx,
+        env,
+        db,
+        &mut journaled_state,
+        &mut Default::default(),
+        call_ctx,
+    ) {
+        Ok(ZKVMExecutionResult { execution_result: result, .. }) => {
+            Ok(ResultAndState { result, state: journaled_state.finalize().0 })
+        }
         Err(err) => eyre::bail!("zk backend: failed while inspecting: {err:?}"),
     }
 }
@@ -162,6 +184,50 @@ where
     ZKVMData::new(db, journaled_state).get_tx_nonce(address).0
 }
 
+/// Batch factory deps on the basis of size.
+///
+/// For large factory_deps the VM can out of gas. To avoid this case we batch factory_deps
+/// on the basis of [MAX_FACTORY_DEPENDENCIES_SIZE_BYTES] and deploy the initial batches
+/// via empty transactions and the last one normally via create.
+fn batch_factory_dependencies(mut factory_deps: Vec<Vec<u8>>) -> Vec<Vec<Vec<u8>>> {
+    let factory_deps_count = factory_deps.len();
+    let factory_deps_sizes = factory_deps.iter().map(|dep| dep.len()).collect_vec();
+    let factory_deps_total_size = factory_deps_sizes.iter().sum::<usize>();
+    tracing::info!(count=factory_deps_count, total=factory_deps_total_size, sizes=?factory_deps_sizes, "optimizing factory_deps");
+
+    let mut batches = vec![];
+    let mut current_batch = vec![];
+    let mut current_batch_len = 0;
+
+    // sort in increasing order of size to ensure the smaller bytecodes are packed efficiently
+    factory_deps.sort_by_key(|a| a.len());
+    for dep in factory_deps {
+        let len = dep.len();
+        let new_len = current_batch_len + len;
+        if new_len > MAX_FACTORY_DEPENDENCIES_SIZE_BYTES && !current_batch.is_empty() {
+            batches.push(current_batch);
+            current_batch = vec![];
+            current_batch_len = 0;
+        }
+        current_batch.push(dep);
+        current_batch_len += len;
+    }
+
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+
+    let batch_count = batches.len();
+    let batch_individual_sizes =
+        batches.iter().map(|deps| deps.iter().map(|dep| dep.len()).collect_vec()).collect_vec();
+    let batch_cumulative_sizes =
+        batches.iter().map(|deps| deps.iter().map(|dep| dep.len()).sum::<usize>()).collect_vec();
+    let batch_total_size = batch_cumulative_sizes.iter().sum::<usize>();
+    tracing::info!(count=batch_count, total=batch_total_size, sizes=?batch_cumulative_sizes, batched_sizes=?batch_individual_sizes, "optimized factory_deps into batches");
+
+    batches
+}
+
 /// Executes a CREATE opcode on the ZK-VM.
 pub fn create<'a, DB, E>(
     call: &CreateInputs,
@@ -170,7 +236,7 @@ pub fn create<'a, DB, E>(
     env: &'a mut Env,
     db: &'a mut DB,
     journaled_state: &'a mut JournaledState,
-    ccx: CheatcodeTracerContext,
+    mut ccx: CheatcodeTracerContext,
 ) -> ZKVMResult<E>
 where
     DB: Database + Send,
@@ -183,21 +249,75 @@ where
     let nonce = ZKVMData::new(db, journaled_state).get_tx_nonce(caller);
 
     let (gas_limit, max_fee_per_gas) = gas_params(env, db, journaled_state, caller);
-    let tx = L2Tx::new(
-        CONTRACT_DEPLOYER_ADDRESS,
-        calldata,
-        nonce,
-        Fee {
-            gas_limit,
-            max_fee_per_gas,
-            max_priority_fee_per_gas: env.tx.gas_priority_fee.unwrap_or_default().to_u256(),
-            gas_per_pubdata_limit: U256::from(20000),
-        },
-        caller.to_h160(),
-        call.value.to_u256(),
-        Some(factory_deps),
-        PaymasterParams::default(),
-    );
+    info!(?gas_limit, ?max_fee_per_gas, "tx gas parameters");
+
+    // If we have more than one factory_dep, we deploy them individually to ensure we
+    // do not out of gas.
+    // TODO: Split on the basis of size, perhaps max 100_000 bytes per batch
+    let batched_factory_deps = batch_factory_dependencies(factory_deps);
+    let batched_factory_deps_count = batched_factory_deps.len();
+    let transactions = if batched_factory_deps.len() > 1 {
+        let mut txs = vec![];
+        let mut last_deps = None;
+        let mut nonce = nonce;
+        for (i, deps) in batched_factory_deps.into_iter().enumerate() {
+            // skip if last factory_dep, so we can deploy it normally
+            if i == batched_factory_deps_count - 1 {
+                last_deps.replace(deps);
+                break
+            }
+
+            txs.push(L2Tx::new(
+                H160::zero(),
+                Vec::default(),
+                nonce,
+                Fee {
+                    gas_limit,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas: env.tx.gas_priority_fee.unwrap_or_default().to_u256(),
+                    gas_per_pubdata_limit: U256::from(20000),
+                },
+                caller.to_h160(),
+                Default::default(),
+                Some(deps),
+                PaymasterParams::default(),
+            ));
+            nonce = Nonce(nonce.saturating_add(1));
+        }
+        txs.push(L2Tx::new(
+            CONTRACT_DEPLOYER_ADDRESS,
+            calldata,
+            nonce,
+            Fee {
+                gas_limit,
+                max_fee_per_gas,
+                max_priority_fee_per_gas: env.tx.gas_priority_fee.unwrap_or_default().to_u256(),
+                gas_per_pubdata_limit: U256::from(20000),
+            },
+            caller.to_h160(),
+            call.value.to_u256(),
+            Some(last_deps.expect("must have an element left")),
+            PaymasterParams::default(),
+        ));
+
+        txs
+    } else {
+        vec![L2Tx::new(
+            CONTRACT_DEPLOYER_ADDRESS,
+            calldata,
+            nonce,
+            Fee {
+                gas_limit,
+                max_fee_per_gas,
+                max_priority_fee_per_gas: env.tx.gas_priority_fee.unwrap_or_default().to_u256(),
+                gas_per_pubdata_limit: U256::from(20000),
+            },
+            caller.to_h160(),
+            call.value.to_u256(),
+            Some(batched_factory_deps.into_iter().next().expect("must have one element")),
+            PaymasterParams::default(),
+        )]
+    };
 
     let call_ctx = CallContext {
         tx_caller: env.tx.caller,
@@ -210,7 +330,46 @@ where
         is_create: true,
     };
 
-    inspect(tx, env, db, journaled_state, ccx, call_ctx)
+    let mut aggregated_result: Option<ZKVMExecutionResult> = None;
+    for (idx, tx) in transactions.into_iter().enumerate() {
+        info!("executing batched tx ({}/{})", idx, batched_factory_deps_count);
+        let result = inspect(tx, env, db, journaled_state, &mut ccx, call_ctx.clone())?;
+        if let Some(aggregated_result) = &mut aggregated_result {
+            match result.execution_result {
+                rExecutionResult::Success { reason, gas_used, gas_refunded, logs, output } => {
+                    aggregated_result.logs.extend(result.logs);
+                    match &mut aggregated_result.execution_result {
+                        rExecutionResult::Success {
+                            reason: agg_reason,
+                            gas_used: agg_gas_used,
+                            gas_refunded: agg_gas_refunded,
+                            logs: agg_logs,
+                            output: agg_output,
+                        } => {
+                            *agg_reason = reason;
+                            *agg_gas_used += gas_used;
+                            *agg_gas_refunded += gas_refunded;
+                            agg_logs.extend(logs);
+                            *agg_output = output;
+                        }
+                        _ => unreachable!("aggregated result must only contain success"),
+                    }
+                }
+                _ => return Ok(result),
+            }
+        } else {
+            match result.execution_result {
+                rExecutionResult::Revert { .. } | rExecutionResult::Halt { .. } => {
+                    return Ok(result)
+                }
+                _ => {
+                    aggregated_result.replace(result);
+                }
+            }
+        }
+    }
+
+    Ok(aggregated_result.expect("must have result"))
 }
 
 /// Executes a CALL opcode on the ZK-VM.
@@ -219,7 +378,7 @@ pub fn call<'a, DB, E>(
     env: &'a mut Env,
     db: &'a mut DB,
     journaled_state: &'a mut JournaledState,
-    ccx: CheatcodeTracerContext,
+    mut ccx: CheatcodeTracerContext,
 ) -> ZKVMResult<E>
 where
     DB: Database + Send,
@@ -230,6 +389,7 @@ where
     let nonce: zksync_types::Nonce = ZKVMData::new(db, journaled_state).get_tx_nonce(caller);
 
     let (gas_limit, max_fee_per_gas) = gas_params(env, db, journaled_state, caller);
+    info!(?gas_limit, ?max_fee_per_gas, "tx gas parameters");
     let tx = L2Tx::new(
         call.contract.to_h160(),
         call.input.to_vec(),
@@ -264,7 +424,7 @@ where
         is_create: false,
     };
 
-    inspect(tx, env, db, journaled_state, ccx, call_ctx)
+    inspect(tx, env, db, journaled_state, &mut ccx, call_ctx)
 }
 
 /// Assign gas parameters that satisfy zkSync's fee model.
@@ -294,26 +454,32 @@ fn inspect<'a, DB, E>(
     env: &'a mut Env,
     db: &'a mut DB,
     journaled_state: &'a mut JournaledState,
-    mut ccx: CheatcodeTracerContext,
+    ccx: &mut CheatcodeTracerContext,
     call_ctx: CallContext,
 ) -> ZKVMResult<E>
 where
     DB: Database + Send,
     <DB as Database>::Error: Debug,
 {
-    let mut era_db = ZKVMData::new_with_system_contracts(db, journaled_state)
-        .with_extra_factory_deps(std::mem::take(&mut ccx.persisted_factory_deps))
+    let chain_id = if env.cfg.chain_id <= u32::MAX as u64 {
+        L2ChainId::from(env.cfg.chain_id as u32)
+    } else {
+        tracing::warn!(provided = ?env.cfg.chain_id, using = DEFAULT_CHAIN_ID, "using default chain id as provided chain_id does not fit into u32");
+        L2ChainId::from(DEFAULT_CHAIN_ID)
+    };
+
+    let persisted_factory_deps = ccx
+        .persisted_factory_deps
+        .as_ref()
+        .map(|factory_deps| (*factory_deps).clone())
+        .unwrap_or_default();
+
+    let mut era_db = ZKVMData::new_with_system_contracts(db, journaled_state, chain_id)
+        .with_extra_factory_deps(persisted_factory_deps)
         .with_storage_accesses(ccx.accesses.take());
 
     let is_create = call_ctx.is_create;
     tracing::info!(?call_ctx, "executing transaction in zk vm");
-
-    let chain_id_u32 = if env.cfg.chain_id <= u32::MAX as u64 {
-        env.cfg.chain_id as u32
-    } else {
-        tracing::warn!(provided = ?env.cfg.chain_id, using = DEFAULT_CHAIN_ID, "using default chain id as provided chain_id does not fit into u32");
-        DEFAULT_CHAIN_ID
-    };
 
     if tx.common_data.signature.is_empty() {
         // FIXME: This is a hack to make sure that the signature is not empty.
@@ -326,7 +492,7 @@ where
         StorageView::new(&mut era_db, modified_storage_keys, tx.common_data.initiator_address)
             .into_rc_ptr();
     let (tx_result, bytecodes, modified_storage) =
-        inspect_inner(tx, storage_ptr, L2ChainId::from(chain_id_u32), ccx, call_ctx);
+        inspect_inner(tx, storage_ptr, chain_id, ccx, call_ctx);
 
     if let Some(record) = &mut era_db.accesses {
         for k in modified_storage.keys() {
@@ -334,20 +500,20 @@ where
         }
     }
 
+    let logs = tx_result
+        .logs
+        .events
+        .clone()
+        .into_iter()
+        .map(|event| revm::primitives::Log {
+            address: event.address.to_address(),
+            topics: event.indexed_topics.iter().cloned().map(|t| B256::from(t.0)).collect(),
+            data: event.value.into(),
+        })
+        .collect_vec();
+
     let execution_result = match tx_result.result {
         ExecutionResult::Success { output, .. } => {
-            let logs = tx_result
-                .logs
-                .events
-                .clone()
-                .into_iter()
-                .map(|event| revm::primitives::Log {
-                    address: event.address.to_address(),
-                    topics: event.indexed_topics.iter().cloned().map(|t| B256::from(t.0)).collect(),
-                    data: event.value.into(),
-                })
-                .collect_vec();
-
             let result = ethabi::decode(&[ethabi::ParamType::Bytes], &output)
                 .ok()
                 .and_then(|result| result.first().cloned())
@@ -366,12 +532,15 @@ where
                 Output::Call(Bytes::from(result))
             };
 
-            rExecutionResult::Success {
-                reason: Eval::Return,
-                gas_used: tx_result.statistics.gas_used as u64,
-                gas_refunded: tx_result.refunds.gas_refunded as u64,
-                logs,
-                output,
+            ZKVMExecutionResult {
+                logs: logs.clone(),
+                execution_result: rExecutionResult::Success {
+                    reason: Eval::Return,
+                    gas_used: tx_result.statistics.gas_used as u64,
+                    gas_refunded: tx_result.refunds.gas_refunded as u64,
+                    logs,
+                    output,
+                },
             }
         }
         ExecutionResult::Revert { output } => {
@@ -381,9 +550,12 @@ where
                 _ => Vec::new(),
             };
 
-            rExecutionResult::Revert {
-                gas_used: env.tx.gas_limit - tx_result.refunds.gas_refunded as u64,
-                output: Bytes::from(output),
+            ZKVMExecutionResult {
+                logs,
+                execution_result: rExecutionResult::Revert {
+                    gas_used: env.tx.gas_limit - tx_result.refunds.gas_refunded as u64,
+                    output: Bytes::from(output),
+                },
             }
         }
         ExecutionResult::Halt { reason } => {
@@ -392,12 +564,27 @@ where
                 Halt::NotEnoughGasProvided => rHalt::OutOfGas(OutOfGasError::BasicOutOfGas),
                 _ => rHalt::PrecompileError,
             };
-            rExecutionResult::Halt {
-                reason: mapped_reason,
-                gas_used: env.tx.gas_limit - tx_result.refunds.gas_refunded as u64,
+
+            ZKVMExecutionResult {
+                logs,
+                execution_result: rExecutionResult::Halt {
+                    reason: mapped_reason,
+                    gas_used: env.tx.gas_limit - tx_result.refunds.gas_refunded as u64,
+                },
             }
         }
     };
+
+    // Insert into persisted_bytecodes. This is currently used in
+    // deploying multiple factory_dep transactions in create to ensure
+    // create does not OOG (Out of Gas) due to large factory deps.
+    if let Some(persisted_factory_deps) = ccx.persisted_factory_deps.as_mut() {
+        for (hash, bytecode) in &bytecodes {
+            let bytecode =
+                bytecode.iter().flat_map(|x| u256_to_h256(*x).to_fixed_bytes()).collect_vec();
+            persisted_factory_deps.insert(hash.to_h256(), bytecode);
+        }
+    }
 
     let mut storage: rHashMap<Address, rHashMap<rU256, StorageSlot>> = Default::default();
     let mut codes: rHashMap<Address, (B256, Bytecode)> = Default::default();
@@ -462,7 +649,7 @@ fn inspect_inner<S: ReadStorage + Send>(
     l2_tx: L2Tx,
     storage: StoragePtr<StorageView<S>>,
     chain_id: L2ChainId,
-    mut ccx: CheatcodeTracerContext,
+    ccx: &mut CheatcodeTracerContext,
     call_ctx: CallContext,
 ) -> (VmExecutionResultAndLogs, HashMap<U256, Vec<U256>>, HashMap<StorageKey, H256>) {
     let l1_gas_price = call_ctx.block_basefee.to::<u64>().max(MAX_L1_GAS_PRICE);
@@ -488,7 +675,7 @@ fn inspect_inner<S: ReadStorage + Send>(
     let tracers = vec![
         CallTracer::new(call_tracer_result.clone()).into_tracer_pointer(),
         CheatcodeTracer::new(
-            ccx.mocked_calls,
+            ccx.mocked_calls.clone(),
             expected_calls,
             cheatcode_tracer_result.clone(),
             call_ctx,
